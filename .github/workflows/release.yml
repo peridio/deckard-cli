@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Security audit
+        uses: rustsec/audit-check@v1.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    permissions:
+      contents: write
+    name: Build and Upload Release Assets
+    runs-on: ${{ matrix.os }}
+    needs: [test, security]
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            suffix: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            suffix: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+        name: Checkout for cargo metadata
+
+      - name: Extract binary name from Cargo.toml
+        id: get_binary_name
+        shell: bash
+        run: |
+          # Extract the package name from Cargo.toml
+          BINARY_NAME=$(grep -E '^name = ' Cargo.toml | head -1 | sed 's/name = "\(.*\)"/\1/')
+          echo "binary_name=$BINARY_NAME" >> $GITHUB_OUTPUT
+          echo "Binary name: $BINARY_NAME"
+
+      - name: Install aws-lc-rs build pre-reqs for Windows
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        run: |
+          choco install nasm -y
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        if: ${{ contains(fromJSON('["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]'), matrix.target) }}
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release (native)
+        if: ${{ !contains(fromJSON('["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl", "aarch64-apple-darwin"]'), matrix.target) }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release (cross)
+        if: ${{ contains(fromJSON('["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]'), matrix.target) }}
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build release (macOS ARM64)
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        run: |
+          rustup target add aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Codesign executable (macOS)
+        if: ${{ contains(fromJSON('["x86_64-apple-darwin", "aarch64-apple-darwin"]'), matrix.target) }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_CODESIGNING_IDENTITY: ${{ secrets.APPLE_CODESIGNING_IDENTITY }}
+        run: |
+          # Require certificate for macOS builds
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "ERROR: macOS code signing certificate not configured"
+            echo "Please configure MACOS_CERTIFICATE secret in GitHub Actions"
+            exit 1
+          fi
+
+          # Create variables
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          BINARY_PATH="./target/${{ matrix.target }}/release/${{ steps.get_binary_name.outputs.binary_name }}"
+
+          # Import certificate
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode --output $CERTIFICATE_PATH
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security default-keychain -s $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Make cert accessible by codesign
+          security import $CERTIFICATE_PATH -P "$MACOS_CERTIFICATE_PWD" -k $KEYCHAIN_PATH -T /usr/bin/codesign
+
+          # Avoid password prompt
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Give permissions
+          chmod +x $BINARY_PATH
+
+          # Code sign
+          /usr/bin/codesign -s $APPLE_CODESIGNING_IDENTITY --deep -f --timestamp -o runtime $BINARY_PATH
+
+          # Verify signing
+          /usr/bin/codesign --verify --strict $BINARY_PATH
+
+          # Zip file for notarization
+          ditto -c -k --sequesterRsrc --keepParent "$BINARY_PATH" "$BINARY_PATH.zip"
+
+          # Notarize app
+          xcrun notarytool submit \
+            --wait \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APP_PASSWORD" \
+            "$BINARY_PATH.zip"
+
+      - name: Package release
+        shell: bash
+        run: |
+          BINARY_NAME="${{ steps.get_binary_name.outputs.binary_name }}${{ matrix.suffix }}"
+          mv "./target/${{ matrix.target }}/release/${{ steps.get_binary_name.outputs.binary_name }}${{ matrix.suffix }}" "./$BINARY_NAME"
+
+          # Create tarball for Unix systems
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            tar -czf "${{ steps.get_binary_name.outputs.binary_name }}-${{ github.ref_name }}_${{ matrix.target }}.tar.gz" "./$BINARY_NAME"
+            echo "ASSET=${{ steps.get_binary_name.outputs.binary_name }}-${{ github.ref_name }}_${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
+          else
+            # Create zip for Windows
+            7z a -tzip "${{ steps.get_binary_name.outputs.binary_name }}-${{ github.ref_name }}_${{ matrix.target }}.zip" "./$BINARY_NAME"
+            echo "ASSET=${{ steps.get_binary_name.outputs.binary_name }}-${{ github.ref_name }}_${{ matrix.target }}.zip" >> $GITHUB_ENV
+          fi
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: ${{ env.ASSET }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
