@@ -11,11 +11,8 @@ cat schema.json | deckard convert > doc.html
 # Read from file, write to file
 deckard convert -i schema.json -o documentation.html
 
-# Read multiple files and merge them
-deckard convert -i schema1.json -i schema2.json --merge -o combined.html
-
-# Minify the output
-deckard convert -i schema.json --minify -o doc.min.html
+# Don't minify the output (minification is the default)
+deckard convert -i schema.json --no-minify -o doc.html
 ```
 
 ## Output Format
