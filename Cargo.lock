@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "deckard"
-version = "1.0.1-rc.1"
+version = "1.0.1"
 dependencies = [
  "assert_cmd",
  "clap",
