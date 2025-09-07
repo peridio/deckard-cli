@@ -7,4 +7,4 @@ on:
 jobs:
   checks:
     name: Run Checks
-    uses: ./.github/workflows/checks.yml
+    uses: ./.github/workflows/checks.yaml
